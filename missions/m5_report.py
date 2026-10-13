@@ -57,7 +57,12 @@ def run(verbose: bool = True) -> dict:
     os.makedirs(os.path.dirname(out_md), exist_ok=True)
     with open(out_md, "w") as f:
         f.write(md)
-    png = report.savings_waterfall(levers, os.path.join(ROOT, "outputs", "savings.png"))
+    png = report.savings_waterfall(
+        levers,
+        os.path.join(ROOT, "outputs", "savings.png"),
+        baseline_usd=baseline,
+        optimized_usd=optimized,
+    )
 
     if verbose:
         print("== M5 Optimization Report ==")

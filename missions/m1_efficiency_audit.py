@@ -46,6 +46,48 @@ def run(verbose: bool = True) -> dict:
         on_demand = num(catalog_by_type()[s["gpu_type"]]["on_demand_hr"])
         idle_waste += metrics.idle_waste_usd(s["idle_hours"], on_demand)
 
+    # --- Extension 2: Right-sizing according to MBU and VRAM unit economics ---
+    catalog_raw = {k: {col: num(val) for col, val in v.items()} for k, v in cat.items()}
+    unit_economics = {}
+    for gtype, row in catalog_raw.items():
+        unit_economics[gtype] = {
+            "on_demand_hr": row["on_demand_hr"],
+            "hbm_gb": row["hbm_gb"],
+            "peak_bw_tbs": row["peak_bw_tbs"],
+            "cost_per_gb_vram": metrics.gpu_cost_per_vram_gb(row["on_demand_hr"], row["hbm_gb"]),
+            "cost_per_tbs": metrics.gpu_cost_per_bandwidth_tbs(row["on_demand_hr"], row["peak_bw_tbs"]),
+        }
+
+    # Evaluate right-sizing for memory-bound / low-MBU GPUs (MBU < 0.35)
+    mbu_rightsizing = []
+    total_rightsize_monthly = 0.0
+    for s in summary:
+        if s["mbu"] < 0.35 and s["gpu_util_pct"] >= 20.0:
+            cur_bw_achieved = s["mbu"] * num(cat[s["gpu_type"]]["peak_bw_tbs"])
+            cand = metrics.find_mbu_rightsize_candidate(
+                current_gpu=s["gpu_type"],
+                achieved_bw_tbs=cur_bw_achieved,
+                current_mbu=s["mbu"],
+                catalog=catalog_raw,
+            )
+            if cand:
+                monthly_saved = cand["hourly_savings"] * 24 * 30
+                total_rightsize_monthly += monthly_saved
+                mbu_rightsizing.append({
+                    "gpu_id": s["gpu_id"],
+                    "current_type": s["gpu_type"],
+                    "current_mbu": s["mbu"],
+                    "achieved_bw": round(cur_bw_achieved, 3),
+                    "proposed_type": cand["gpu_type"],
+                    "proposed_bw": cand["peak_bw_tbs"],
+                    "proposed_mbu": cand["expected_mbu"],
+                    "hourly_savings": cand["hourly_savings"],
+                    "savings_pct": cand["savings_pct"],
+                    "monthly_savings": round(monthly_saved),
+                    "cur_cost_per_gb": round(unit_economics[s["gpu_type"]]["cost_per_gb_vram"], 4),
+                    "prop_cost_per_gb": round(unit_economics[cand["gpu_type"]]["cost_per_gb_vram"], 4),
+                })
+
     if verbose:
         print("== M1 Efficiency Audit ==")
         print(f"{'GPU':14}{'type':7}{'util%':>7}{'MFU':>7}{'MBU':>7}{'idle_h':>8}")
@@ -54,7 +96,27 @@ def run(verbose: bool = True) -> dict:
         print(f"\nGPU-Util LIES (util>=90% but MFU<30%): {[l['gpu_id'] for l in lies]}")
         print(f"Idle waste (1 day): ${idle_waste:,.2f}  ->  ${idle_waste*30:,.0f}/month")
 
-    return {"summary": summary, "lies": lies, "idle_waste_daily": round(idle_waste, 2)}
+        # Extension 2 detailed reporting
+        print("\n== Extension 2: Right-sizing theo MBU & VRAM Economics ==")
+        print("Bảng đơn giá VRAM và băng thông theo GPU catalog:")
+        print(f"{'GPU':8}{'$/hr':>7}{'VRAM(GB)':>10}{'BW(TB/s)':>10}{'$/GB-VRAM/h':>14}{'$/(TB/s)/h':>13}")
+        for gtype, u in sorted(unit_economics.items(), key=lambda x: x[1]["cost_per_gb_vram"]):
+            print(f"{gtype:8}${u['on_demand_hr']:>6.2f}{u['hbm_gb']:>10.0f}{u['peak_bw_tbs']:>10.2f}${u['cost_per_gb_vram']:>13.4f}${u['cost_per_tbs']:>12.2f}")
+
+        print("\nĐề xuất Right-sizing cho các GPU memory-bound (MBU thấp):")
+        print(f"{'GPU ID':12}{'Current':9}{'MBU':>6}{'Proposed':10}{'Prop BW':>9}{'Savings/mo':>12}{'Save%':>7}")
+        for r in mbu_rightsizing:
+            print(f"{r['gpu_id']:12}{r['current_type']:9}{r['current_mbu']:>6.3f}{r['proposed_type']:10}{r['proposed_bw']:>8.1f}T${r['monthly_savings']:>10,}{r['savings_pct']:>6.1f}%")
+        print(f"Tổng tiết kiệm hàng tháng từ right-sizing theo MBU: ${total_rightsize_monthly:,.0f}/tháng")
+        print("Insight: Không chỉ chọn GPU rẻ nhất ($/GPU-hr) vì workload decode bị nghẽn bởi memory bandwidth (HBM) và dung lượng VRAM (chứa KV-cache); nếu ép xuống L4 (0.3 TB/s, 24GB) sẽ gây nghẽn nghiêm trọng hoặc OOM!")
+
+    return {
+        "summary": summary,
+        "lies": lies,
+        "idle_waste_daily": round(idle_waste, 2),
+        "mbu_rightsizing": mbu_rightsizing,
+        "mbu_monthly_savings": round(total_rightsize_monthly),
+    }
 
 
 if __name__ == "__main__":

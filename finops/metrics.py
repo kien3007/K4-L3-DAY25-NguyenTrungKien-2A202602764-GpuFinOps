@@ -61,3 +61,64 @@ def flag_util_lies(rows, util_threshold: float = 0.90, mfu_threshold: float = 0.
 def idle_waste_usd(idle_hours: float, on_demand_hr: float) -> float:
     """Dollars burned by a GPU left running idle (training done, instance up)."""
     return max(0.0, idle_hours) * max(0.0, on_demand_hr)
+
+
+def gpu_cost_per_vram_gb(on_demand_hr: float, hbm_gb: float) -> float:
+    """Unit economics: hourly cost per GB of VRAM ($ / GB-hr)."""
+    if hbm_gb <= 0:
+        return 0.0
+    return on_demand_hr / hbm_gb
+
+
+def gpu_cost_per_bandwidth_tbs(on_demand_hr: float, peak_bw_tbs: float) -> float:
+    """Unit economics: hourly cost per TB/s memory bandwidth ($ / (TB/s)-hr)."""
+    if peak_bw_tbs <= 0:
+        return 0.0
+    return on_demand_hr / peak_bw_tbs
+
+
+def find_mbu_rightsize_candidate(
+    current_gpu: str,
+    achieved_bw_tbs: float,
+    current_mbu: float,
+    catalog: dict,
+    mbu_headroom: float = 0.60,
+) -> dict | None:
+    """Find a cheaper GPU replacement for memory-bound workloads (Extension 2).
+
+    Instead of blindly picking the cheapest GPU (which causes OOM or severe bandwidth throttle),
+    ensures candidate GPU has:
+      1. Peak bandwidth >= achieved_bw / mbu_headroom (ensuring target MBU <= 60% without throttling).
+      2. Lower on-demand hourly price.
+    """
+    cur_info = catalog.get(current_gpu)
+    if not cur_info:
+        return None
+    cur_price = float(cur_info["on_demand_hr"])
+    cur_vram = float(cur_info["hbm_gb"])
+    min_bw_needed = achieved_bw_tbs / mbu_headroom
+
+    best_candidate = None
+    best_price = cur_price
+
+    for gtype, info in catalog.items():
+        if gtype == current_gpu:
+            continue
+        cand_price = float(info["on_demand_hr"])
+        cand_bw = float(info["peak_bw_tbs"])
+        cand_vram = float(info["hbm_gb"])
+
+        # Candidate must be cheaper and satisfy bandwidth headroom
+        if cand_price < best_price and cand_bw >= min_bw_needed:
+            best_candidate = {
+                "gpu_type": gtype,
+                "on_demand_hr": cand_price,
+                "hbm_gb": cand_vram,
+                "peak_bw_tbs": cand_bw,
+                "hourly_savings": round(cur_price - cand_price, 3),
+                "savings_pct": round((1.0 - cand_price / cur_price) * 100.0, 1),
+                "expected_mbu": round(achieved_bw_tbs / cand_bw, 3),
+            }
+            best_price = cand_price
+
+    return best_candidate

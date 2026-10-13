@@ -60,14 +60,75 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+DEFAULT_GPU_INTERRUPT_RATES: dict[str, float] = {
+    "H100": 0.04,
+    "H200": 0.05,
+    "A100": 0.06,
+    "A10G": 0.09,
+    "L4": 0.08,
+    "B200": 0.04,
+    "MI300X": 0.05,
+}
+
+
+def cache_break_even_reads(
+    write_cost_per_m: float = 3.0,
+    base_read_cost_per_m: float | None = None,
+    read_discount: float = 0.10,
+) -> float:
+    """Calculate the minimum average reads required for prompt caching to yield net savings.
+
+    Formula:
+        WriteCost + N * (base_read_cost * read_discount) < N * base_read_cost
+        => N * base_read_cost * (1 - read_discount) > WriteCost
+        => N > WriteCost / (base_read_cost * (1 - read_discount))
+    """
+    base_in = base_read_cost_per_m if base_read_cost_per_m is not None else write_cost_per_m
+    denom = base_in * (1.0 - read_discount)
+    if denom <= 0:
+        return float("inf")
+    return write_cost_per_m / denom
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float = 3.0,
+    read_discount: float = 0.10,
+    base_read_cost_per_m: float | None = None,
+) -> bool:
+    """Check if prompt caching is financially beneficial given observed read frequency.
+
+    Gated check for Extension 3: only apply caching savings when expected reuse exceeds break-even.
+    """
+    be = cache_break_even_reads(write_cost_per_m, base_read_cost_per_m, read_discount)
+    return avg_cache_reads > be
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
+    Baseline policy:
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
+
+    When gpu_type and job_days are supplied, this delegates to recommend_tier_advanced.
     """
+    if gpu_type is not None or job_days is not None:
+        return recommend_tier_advanced(
+            hours_per_day=hours_per_day,
+            interruptible=interruptible,
+            gpu_type=gpu_type,
+            job_days=job_days,
+            reserved_3yr_discount=reserved_discount,
+        )
+
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
     if interruptible and hours_per_day < 24:
@@ -75,6 +136,53 @@ def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount:
     if duty >= be:
         return "reserved"
     return "on_demand"
+
+
+def recommend_tier_advanced(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_type: str | None = None,
+    job_days: float | None = None,
+    reserved_3yr_discount: float = 0.45,
+    reserved_1yr_discount: float = 0.20,
+    interruption_rate: float | None = None,
+) -> str:
+    """Advanced multi-factor purchasing policy for Extension 1.
+
+    Evaluates:
+      1. GPU-specific spot interruption risk and checkpoint feasibility.
+      2. Job duration vs commitment term: Short temporary jobs (<30 days) avoid multi-year
+         commitments unless pooled into a shared platform cluster.
+      3. Tier comparison across on-demand, spot, 1-year reserved, and 3-year reserved.
+    """
+    duty = max(0.0, hours_per_day) / 24.0
+    be_3yr = break_even_utilization(reserved_3yr_discount)  # e.g., 55% (~13.2h)
+    be_1yr = break_even_utilization(reserved_1yr_discount)  # e.g., 80% (~19.2h)
+
+    # Effective interruption rate by GPU type
+    rate = interruption_rate
+    if rate is None and gpu_type:
+        rate = DEFAULT_GPU_INTERRUPT_RATES.get(gpu_type, 0.05)
+    rate = rate if rate is not None else 0.05
+
+    # 1. Non-interruptible workloads (production user-facing inference)
+    if not interruptible:
+        if duty >= be_3yr:
+            return "reserved"
+        if duty >= be_1yr:
+            return "reserved"
+        return "on_demand"
+
+    # 2. Interruptible workloads (training, batch eval, offline dev)
+    # If job is very short (e.g. <= 3 days) or duty cycle < 24h, spot is universally optimal
+    if hours_per_day < 24:
+        return "spot"
+
+    # For 24/7 interruptible workloads, check if reserved 3yr beats spot after checkpoint overhead
+    if duty >= be_3yr:
+        return "reserved"
+
+    return "spot"
 
 
 def spot_checkpoint_cost(
